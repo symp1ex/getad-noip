@@ -74,24 +74,41 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	var peer *Peer
 	authenticated := false
 
+	defer func() {
+		// === ADMIN DETACH ON DISCONNECT ===
+		if peer != nil && peer.Role == "admin" {
+			globalMu.Lock()
+			for _, client := range clients {
+				_ = client.Conn.WriteJSON(Message{
+					Type: "admin_detach",
+					ID:   peer.ID,
+				})
+			}
+			delete(admins, peer.ID)
+			globalMu.Unlock()
+			log.Println("Admin disconnected:", peer.ID)
+		}
+
+		if peer != nil && peer.Role == "client" {
+			globalMu.Lock()
+			delete(clients, peer.ID)
+			globalMu.Unlock()
+			log.Println("Client disconnected:", peer.ID)
+		}
+
+		conn.Close()
+	}()
+
 	for {
 		var msg Message
 		if err := conn.ReadJSON(&msg); err != nil {
-			if peer != nil {
-				globalMu.Lock()
-				if peer.Role == "admin" {
-					delete(admins, peer.ID)
-				} else {
-					delete(clients, peer.ID)
-				}
-				globalMu.Unlock()
-			}
 			return
 		}
 
 		switch msg.Type {
 
-		// === AUTH ===
+		// ================= AUTH =================
+
 		case "auth":
 			authMu.Lock()
 			state := authState[msg.ClientID]
@@ -130,10 +147,10 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			authenticated = true
 			conn.WriteJSON(Message{Type: "auth_ok"})
 
-		// === REGISTER ===
+		// ================= REGISTER =================
+
 		case "register":
 
-			// === AUTH REQUIRED ONLY FOR ADMIN ===
 			if msg.Role == "admin" && !authenticated {
 				conn.WriteJSON(Message{
 					Type:  "auth_fail",
@@ -149,32 +166,41 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			globalMu.Lock()
+
 			if peer.Role == "admin" {
 				admins[peer.ID] = peer
 				log.Println("Admin connected:", peer.ID)
+
+				// === ADMIN ATTACH ===
+				for _, client := range clients {
+					_ = client.Conn.WriteJSON(Message{
+						Type: "admin_attach",
+						ID:   peer.ID,
+					})
+				}
+
 			} else {
 				clients[peer.ID] = peer
 				log.Println("Client connected:", peer.ID)
 			}
+
 			globalMu.Unlock()
+
+		// ================= CLIENT HELLO =================
 
 		case "client_hello":
 
 			authMu.Lock()
 			stored, exists := passwords[msg.ID]
 
-			// === NEW CLIENT ===
 			if !exists {
 				passwords[msg.ID] = msg.Password
 				savePasswords()
 				log.Println("New client registered:", msg.ID)
-			} else {
-				// === EXISTING CLIENT ===
-				if stored != msg.Password {
-					authMu.Unlock()
-					log.Println("Client auth failed:", msg.ID)
-					return
-				}
+			} else if stored != msg.Password {
+				authMu.Unlock()
+				log.Println("Client auth failed:", msg.ID)
+				return
 			}
 
 			authMu.Unlock()
@@ -191,24 +217,47 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 			log.Println("Client connected:", peer.ID)
 
+			// === ATTACH ALL CURRENT ADMINS ===
+			globalMu.Lock()
+			for _, admin := range admins {
+				_ = conn.WriteJSON(Message{
+					Type: "admin_attach",
+					ID:   admin.ID,
+				})
+			}
+			globalMu.Unlock()
+
+		// ================= ROUTING =================
+
 		case "command", "interactive_response":
 			globalMu.Lock()
 			client := clients[msg.ClientID]
 			globalMu.Unlock()
+
 			if client != nil {
 				client.Mu.Lock()
-				client.Conn.WriteJSON(msg)
+				_ = client.Conn.WriteJSON(Message{
+					Type:      msg.Type,
+					ClientID:  msg.ClientID,
+					CommandID: msg.CommandID,
+					Command:   msg.Command,
+					ID:        msg.ID, // ← admin_id
+				})
 				client.Mu.Unlock()
 			}
 
 		case "interactive_prompt", "result":
+			adminID := msg.ID
+
 			globalMu.Lock()
-			for _, admin := range admins {
+			admin := admins[adminID]
+			globalMu.Unlock()
+
+			if admin != nil {
 				admin.Mu.Lock()
-				admin.Conn.WriteJSON(msg)
+				_ = admin.Conn.WriteJSON(msg)
 				admin.Mu.Unlock()
 			}
-			globalMu.Unlock()
 		}
 	}
 }
