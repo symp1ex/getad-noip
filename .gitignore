@@ -1,0 +1,6 @@
+# Ignore IDE files
+.idea/
+# Ignore test files
+/*.exe
+/*.txt
+/*.json

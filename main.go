@@ -91,8 +91,20 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if peer != nil && peer.Role == "client" {
 			globalMu.Lock()
+			
+			for _, admin := range admins {
+				admin.Mu.Lock()
+				_ = admin.Conn.WriteJSON(Message{
+					Type:     "session_closed",
+					ClientID: peer.ID,
+					Error:    "Client disconnected",
+				})
+				admin.Mu.Unlock()
+			}
+
 			delete(clients, peer.ID)
 			globalMu.Unlock()
+
 			log.Println("Client disconnected:", peer.ID)
 		}
 
@@ -256,6 +268,22 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			if admin != nil {
 				admin.Mu.Lock()
 				_ = admin.Conn.WriteJSON(msg)
+				admin.Mu.Unlock()
+			}
+
+		case "session_closed":
+			adminID := msg.ID
+
+			globalMu.Lock()
+			admin := admins[adminID]
+			globalMu.Unlock()
+
+			if admin != nil {
+				admin.Mu.Lock()
+				_ = admin.Conn.WriteJSON(Message{
+					Type:  "session_closed",
+					Error: "CMD session terminated on client",
+				})
 				admin.Mu.Unlock()
 			}
 		}
