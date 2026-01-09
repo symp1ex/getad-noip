@@ -134,6 +134,24 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.Type {
 
+		case "admin_hello":
+
+			if msg.ApiKey != "123" {
+				log.Println("Invalid admin api_key")
+				_ = conn.WriteJSON(Message{
+					Type:  "error",
+					Error: "Invalid admin api_key",
+				})
+				return
+			}
+
+			// admin api_key валиден
+			authenticated = true
+
+			_ = conn.WriteJSON(Message{
+				Type: "admin_hello_ok",
+			})
+
 		// ================= AUTH =================
 
 		case "auth":
@@ -178,7 +196,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		case "register":
 
 			if msg.Role == "admin" && !authenticated {
-				conn.WriteJSON(Message{
+				_ = conn.WriteJSON(Message{
 					Type:  "auth_fail",
 					Error: "Admin not authenticated",
 				})
