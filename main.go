@@ -258,6 +258,16 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				authMu.Unlock()
 
 				log.Println("Password updated via pass-only connection:", msg.ID)
+
+				_ = conn.WriteJSON(Message{
+					Type: "password_updated",
+				})
+
+				// корректное закрытие WebSocket
+				_ = conn.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "password updated"),
+				)
 				return
 			}
 
