@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,9 +59,15 @@ var (
 	clients  = make(map[string]*Peer)
 	globalMu sync.Mutex
 
-	passwords = make(map[string]*PasswordEntry)
-	authState = make(map[string]*AuthState)
-	authMu    sync.Mutex
+	passwords    = make(map[string]*PasswordEntry)
+	authStateMu  sync.Mutex
+	authStateMap = make(map[string]*AuthState)
+	authMu       sync.Mutex
+
+	adminAttempts   = make(map[string]int)
+	adminAttemptsMu sync.Mutex
+	blacklist       = make(map[string]struct{})
+	blacklistMu     sync.Mutex
 )
 
 func loadPasswords() {
@@ -82,9 +89,111 @@ func generateTempPass() string {
 	return fmt.Sprintf("%05d", rand.Intn(100000))
 }
 
+func loadBlacklist() {
+	data, err := os.ReadFile("blacklist.txt")
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			blacklist[line] = struct{}{}
+		}
+	}
+}
+
+// Добавляем IP в blacklist
+func addToBlacklist(ip string) {
+	blacklistMu.Lock()
+	defer blacklistMu.Unlock()
+	if _, exists := blacklist[ip]; exists {
+		return
+	}
+	blacklist[ip] = struct{}{}
+	f, _ := os.OpenFile("blacklist.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	defer f.Close()
+	f.WriteString(ip + "\n")
+}
+
+func handleClientAuth(remoteIP string, msg Message, conn *websocket.Conn, entry *PasswordEntry) bool {
+	authStateMu.Lock()
+	state, exists := authStateMap[remoteIP]
+	if !exists {
+		state = &AuthState{}
+		authStateMap[remoteIP] = state
+	}
+	authStateMu.Unlock()
+
+	now := time.Now()
+	if state.Blocked.After(now) {
+		_ = conn.WriteJSON(Message{
+			Type:  "auth_fail",
+			Error: fmt.Sprintf("Too many failed attempts. Try again in %d seconds", int(state.Blocked.Sub(now).Seconds())),
+		})
+		return false
+	}
+
+	ok := false
+	// === проверка паролей ===
+	if entry.Password != false {
+		if enc, ok2 := entry.Password.(string); ok2 && crypto.Verify(enc, msg.Password) {
+			ok = true
+		}
+	}
+	if entry.TempPass != "" && crypto.Verify(entry.TempPass, msg.Password) {
+		ok = true
+	}
+
+	if !ok {
+		// неудачная попытка
+		authStateMu.Lock()
+		state.Attempts++
+		if state.Attempts >= 3 {
+			state.Blocked = time.Now().Add(1 * time.Minute)
+			state.Attempts = 0 // сбрасываем попытки после блокировки
+			_ = conn.WriteJSON(Message{
+				Type:  "auth_fail",
+				Error: "Too many failed attempts. You are blocked for 1 minute",
+			})
+		} else {
+			_ = conn.WriteJSON(Message{
+				Type:  "auth_fail",
+				Error: fmt.Sprintf("Invalid password (%d/3 attempts)", state.Attempts),
+			})
+		}
+		authStateMu.Unlock()
+		return false
+	}
+
+	// успешная авторизация → сброс состояния
+	authStateMu.Lock()
+	state.Attempts = 0
+	state.Blocked = time.Time{}
+	authStateMu.Unlock()
+
+	_ = conn.WriteJSON(Message{Type: "auth_ok"})
+	return true
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	remoteIP := strings.Split(r.RemoteAddr, ":")[0]
+
+	// Проверка blacklist
+	blacklistMu.Lock()
+	_, banned := blacklist[remoteIP]
+	blacklistMu.Unlock()
+	if banned {
+		_ = conn.WriteJSON(Message{
+			Type:  "error",
+			Error: "Your IP is banned",
+		})
 		return
 	}
 
@@ -135,21 +244,35 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch msg.Type {
-
 		case "admin_hello":
-
 			if msg.ApiKey != "123" {
-				log.Println("Invalid admin api_key")
+				adminAttemptsMu.Lock()
+				adminAttempts[remoteIP]++
+				attempts := adminAttempts[remoteIP]
+				adminAttemptsMu.Unlock()
+
+				if attempts >= 3 {
+					addToBlacklist(remoteIP)
+					_ = conn.WriteJSON(Message{
+						Type:  "error",
+						Error: "Your IP is banned due to too many failed attempts",
+					})
+					return
+				}
+
 				_ = conn.WriteJSON(Message{
 					Type:  "error",
-					Error: "Invalid admin api_key",
+					Error: fmt.Sprintf("Invalid API key (%d/3 attempts)", attempts),
 				})
-				return
+				continue
 			}
 
-			// admin api_key валиден
-			authenticated = true
+			// успешная авторизация → сброс счетчика
+			adminAttemptsMu.Lock()
+			delete(adminAttempts, remoteIP)
+			adminAttemptsMu.Unlock()
 
+			authenticated = true
 			_ = conn.WriteJSON(Message{
 				Type: "admin_hello_ok",
 			})
@@ -157,48 +280,23 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		// ================= AUTH =================
 
 		case "auth":
-
 			authMu.Lock()
 			entry, exists := passwords[msg.ClientID]
+			authMu.Unlock()
 
 			if !exists {
-				authMu.Unlock()
-				conn.WriteJSON(Message{
+				_ = conn.WriteJSON(Message{
 					Type:  "auth_fail",
 					Error: "Unknown client",
 				})
 				continue
 			}
 
-			ok := false
-
-			// === ПРОВЕРКА ПОСТОЯННОГО ПАРОЛЯ ===
-			if entry.Password != false {
-				enc, _ := entry.Password.(string)
-				if crypto.Verify(enc, msg.Password) {
-					ok = true
-				}
-			}
-
-			// === ПРОВЕРКА ВРЕМЕННОГО ПАРОЛЯ ===
-			if entry.TempPass != "" {
-				if crypto.Verify(entry.TempPass, msg.Password) {
-					ok = true
-				}
-			}
-
-			authMu.Unlock()
-
-			if !ok {
-				conn.WriteJSON(Message{
-					Type:  "auth_fail",
-					Error: "Invalid password",
-				})
+			if !handleClientAuth(remoteIP, msg, conn, entry) {
 				continue
 			}
 
 			authenticated = true
-			conn.WriteJSON(Message{Type: "auth_ok"})
 
 		// ================= REGISTER =================
 
@@ -394,6 +492,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	loadPasswords()
+	loadBlacklist()
 
 	http.HandleFunc("/ws", wsHandler)
 	log.Println("Server listening on :22233")
