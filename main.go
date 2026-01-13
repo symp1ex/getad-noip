@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"posrelayd-noip/crypto"
 )
 
 type Peer struct {
@@ -170,12 +172,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 			ok := false
 
-			if entry.Password != false && msg.Password == entry.Password {
-				ok = true
+			// === ПРОВЕРКА ПОСТОЯННОГО ПАРОЛЯ ===
+			if entry.Password != false {
+				enc, _ := entry.Password.(string)
+				if crypto.Verify(enc, msg.Password) {
+					ok = true
+				}
 			}
 
-			if entry.TempPass != "" && msg.Password == entry.TempPass {
-				ok = true
+			// === ПРОВЕРКА ВРЕМЕННОГО ПАРОЛЯ ===
+			if entry.TempPass != "" {
+				if crypto.Verify(entry.TempPass, msg.Password) {
+					ok = true
+				}
 			}
 
 			authMu.Unlock()
@@ -253,7 +262,17 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			// PASS-ONLY РЕЖИМ (-pass)
 			// =========================
 			if msg.Password != "" {
-				entry.Password = msg.Password
+				encrypted, err := crypto.Encrypt(msg.Password)
+				if err != nil {
+					authMu.Unlock()
+					_ = conn.WriteJSON(Message{
+						Type:  "error",
+						Error: "Password encryption failed",
+					})
+					return
+				}
+
+				entry.Password = encrypted
 				savePasswords()
 				authMu.Unlock()
 
@@ -263,7 +282,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					Type: "password_updated",
 				})
 
-				// корректное закрытие WebSocket
 				_ = conn.WriteMessage(
 					websocket.CloseMessage,
 					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "password updated"),
@@ -275,7 +293,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			// ОБЫЧНЫЙ PY-КЛИЕНТ
 			// =========================
 
-			entry.TempPass = generateTempPass()
+			plainTemp := generateTempPass()
+
+			encryptedTemp, err := crypto.Encrypt(plainTemp)
+			if err != nil {
+				authMu.Unlock()
+				_ = conn.WriteJSON(Message{
+					Type:  "error",
+					Error: "Temp password encryption failed",
+				})
+				return
+			}
+
+			entry.TempPass = encryptedTemp
 			savePasswords()
 
 			authMu.Unlock()
@@ -300,7 +330,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			// === ОТПРАВЛЯЕМ temp_pass PY-КЛИЕНТУ ===
 			_ = conn.WriteJSON(Message{
 				Type:     "temp_pass",
-				TempPass: entry.TempPass,
+				TempPass: plainTemp,
 			})
 
 			// === ATTACH ADMINS ===
