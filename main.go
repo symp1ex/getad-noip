@@ -67,6 +67,9 @@ var (
 	adminAttempts   = make(map[string]int)
 	adminAttemptsMu sync.Mutex
 
+	clientAttempts   = make(map[string]int)
+	clientAttemptsMu sync.Mutex
+
 	protocolViolations   = make(map[string]int)
 	protocolViolationsMu sync.Mutex
 
@@ -247,6 +250,51 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if !authenticated {
+			switch msg.Type {
+			case "admin_hello", "auth", "client_hello":
+				// разрешено
+			default:
+				protocolViolationsMu.Lock()
+				protocolViolations[remoteIP]++
+				attempts := protocolViolations[remoteIP]
+				protocolViolationsMu.Unlock()
+
+				log.Printf(
+					"Protocol violation (unauthenticated) from %s: '%s' (%d/3)",
+					remoteIP, msg.Type, attempts,
+				)
+
+				if attempts >= 3 {
+					addToBlacklist(remoteIP)
+					_ = conn.WriteJSON(Message{
+						Type:  "error",
+						Error: "Your IP is banned due to protocol violations",
+					})
+					return
+				}
+
+				_ = conn.WriteJSON(Message{
+					Type:  "error",
+					Error: "Authentication required",
+				})
+				continue
+			}
+		}
+
+		if authenticated && peer == nil {
+			switch msg.Type {
+			case "register", "auth":
+				// разрешено
+			default:
+				_ = conn.WriteJSON(Message{
+					Type:  "error",
+					Error: "Registration required",
+				})
+				continue
+			}
+		}
+
 		switch msg.Type {
 		case "admin_hello":
 			if msg.ApiKey != "123" {
@@ -296,6 +344,18 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				_ = conn.WriteJSON(Message{
 					Type:  "auth_fail",
 					Error: "Unknown client",
+				})
+				continue
+			}
+
+			globalMu.Lock()
+			client, online := clients[msg.ClientID]
+			globalMu.Unlock()
+
+			if !online || client == nil {
+				_ = conn.WriteJSON(Message{
+					Type:  "auth_fail",
+					Error: "Client is offline",
 				})
 				continue
 			}
@@ -354,9 +414,40 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		case "client_hello":
 
 			if msg.ApiKey != "123" {
-				log.Println("Invalid API key from client:", msg.ID)
-				return
+				clientAttemptsMu.Lock()
+				clientAttempts[remoteIP]++
+				attempts := clientAttempts[remoteIP]
+				clientAttemptsMu.Unlock()
+
+				log.Printf(
+					"Invalid API key from client %s (%d/3)",
+					remoteIP, attempts,
+				)
+
+				if attempts >= 3 {
+					addToBlacklist(remoteIP)
+					_ = conn.WriteJSON(Message{
+						Type:  "error",
+						Error: "Your IP is banned due to too many failed API key attempts",
+					})
+					return
+				}
+
+				_ = conn.WriteJSON(Message{
+					Type:  "error",
+					Error: fmt.Sprintf("Invalid API key (%d/3 attempts)", attempts),
+				})
+				continue
 			}
+
+			// успешный api_key → сброс счётчиков
+			clientAttemptsMu.Lock()
+			delete(clientAttempts, remoteIP)
+			clientAttemptsMu.Unlock()
+
+			protocolViolationsMu.Lock()
+			delete(protocolViolations, remoteIP)
+			protocolViolationsMu.Unlock()
 
 			authMu.Lock()
 
@@ -442,6 +533,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				Type:     "temp_pass",
 				TempPass: plainTemp,
 			})
+
+			authenticated = true
 
 			// === ATTACH ADMINS ===
 			for _, admin := range admins {
