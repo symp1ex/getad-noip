@@ -330,7 +330,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.Type {
 		case "admin_hello":
-			if msg.ApiKey != "123" {
+			if msg.ApiKey != "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53" {
 				adminAttemptsMu.Lock()
 				adminAttempts[remoteIP]++
 				attempts := adminAttempts[remoteIP]
@@ -446,7 +446,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		case "client_hello":
 
-			if msg.ApiKey != "123" {
+			if msg.ApiKey != "b5679e9e-b5b5-4eaf-bb99-83dba95f9f53" {
 				clientAttemptsMu.Lock()
 				clientAttempts[remoteIP]++
 				attempts := clientAttempts[remoteIP]
@@ -579,7 +579,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 		// ================= ROUTING =================
 
-		case "command", "interactive_response", "control":
+		case "command", "control":
 			globalMu.Lock()
 			client := clients[msg.ClientID]
 			globalMu.Unlock()
@@ -596,7 +596,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				client.Mu.Unlock()
 			}
 
-		case "interactive_prompt", "result":
+		case "result":
 			adminID := msg.ID
 
 			globalMu.Lock()
