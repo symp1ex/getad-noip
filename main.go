@@ -23,8 +23,10 @@ type Peer struct {
 	Role string // "admin" or "client"
 	Conn *websocket.Conn
 
-	sendQueue chan Message
-	done      chan struct{}
+	sendQueue chan OutboundMessage
+	pingDone  chan struct{}
+
+	done chan struct{}
 }
 
 type Message struct {
@@ -43,6 +45,19 @@ type Message struct {
 	TempPass string `json:"temp_pass,omitempty"`
 	Error    string `json:"error,omitempty"`
 }
+
+type OutboundMessage struct {
+	Kind MessageKind
+	JSON *Message
+	Ping []byte
+}
+
+type MessageKind int
+
+const (
+	OutboundJSON MessageKind = iota
+	OutboundPing
+)
 
 type AuthState struct {
 	Attempts int
@@ -91,11 +106,24 @@ func (p *Peer) StartWriter() {
 	go func() {
 		for {
 			select {
-			case msg, ok := <-p.sendQueue:
+			case out, ok := <-p.sendQueue:
 				if !ok {
 					return
 				}
-				_ = p.Conn.WriteJSON(msg)
+
+				switch out.Kind {
+				case OutboundJSON:
+					if out.JSON != nil {
+						_ = p.Conn.WriteJSON(out.JSON)
+					}
+
+				case OutboundPing:
+					_ = p.Conn.WriteMessage(
+						websocket.PingMessage,
+						out.Ping,
+					)
+				}
+
 			case <-p.done:
 				return
 			}
@@ -105,9 +133,11 @@ func (p *Peer) StartWriter() {
 
 func (p *Peer) Enqueue(msg Message) {
 	select {
-	case p.sendQueue <- msg:
+	case p.sendQueue <- OutboundMessage{
+		Kind: OutboundJSON,
+		JSON: &msg,
+	}:
 	case <-p.done:
-		// соединение закрыто — молча игнорируем
 	}
 }
 
@@ -119,6 +149,32 @@ func (p *Peer) Close() {
 		close(p.done)
 		close(p.sendQueue)
 	}
+}
+
+func (p *Peer) StartPing(interval time.Duration) {
+	p.pingDone = make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				select {
+				case p.sendQueue <- OutboundMessage{
+					Kind: OutboundPing,
+					Ping: []byte("ping"),
+				}:
+				case <-p.done:
+					return
+				}
+
+			case <-p.done:
+				return
+			}
+		}
+	}()
 }
 
 func loadPasswords() {
@@ -270,6 +326,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	// ТОЛЬКО ТЕПЕРЬ UPGRADE
 	conn, err := upgrader.Upgrade(w, r, nil)
+
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
 	if err != nil {
 		return
 	}
@@ -475,10 +539,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				ID:        msg.ID,
 				Role:      msg.Role,
 				Conn:      conn,
-				sendQueue: make(chan Message, 32),
+				sendQueue: make(chan OutboundMessage, 32),
 				done:      make(chan struct{}),
 			}
 			peer.StartWriter()
+			peer.StartPing(30 * time.Second)
 
 			globalMu.Lock()
 			admins[peer.ID] = peer
@@ -612,10 +677,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 				ID:        msg.ID,
 				Role:      "client",
 				Conn:      conn,
-				sendQueue: make(chan Message, 32),
+				sendQueue: make(chan OutboundMessage, 32),
 				done:      make(chan struct{}),
 			}
 			peer.StartWriter()
+			peer.StartPing(30 * time.Second)
 
 			globalMu.Lock()
 			clients[peer.ID] = peer

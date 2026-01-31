@@ -6,6 +6,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY crypto ./crypto
+COPY logger ./logger
 COPY main.go ./
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
